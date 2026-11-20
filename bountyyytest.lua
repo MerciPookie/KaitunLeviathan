@@ -2338,69 +2338,6 @@ end
 
 SetupHUD()
 
-local ServerHopCache = { List = nil, Fetching = false }
-
-local function FetchServerList(timeout)
-    -- Hard guard: the legacy parallel fetch is disabled whenever Mobile Mode is on.
-    if Settings.MobileMode == true then return nil end
-    local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
-    if not browser then return nil end
-    local servers = {}
-
-    -- Desktop mode: retain the existing parallel fetch behavior.
-    local pending = 0
-    for page = 1, 100 do
-        pending = pending + 1
-        task.delay(page * 0.02, function()
-            if Settings.MobileMode == true then
-                pending = pending - 1
-                return
-            end
-            local ok, result = pcall(function() return browser:InvokeServer(page) end)
-            if not ok then
-                local tries = 0
-                repeat
-                    task.wait(0.5)
-                    tries = tries + 1
-                    ok, result = pcall(function() return browser:InvokeServer(page) end)
-                until ok or tries >= 2
-            end
-            if ok and type(result) == "table" then
-                for job, info in pairs(result) do
-                    if type(info) == "table" then
-                        servers[job] = {
-                            Region = tostring(info.Region or "Unknown"),
-                            Count = tonumber(info.Count) or 0,
-                            Bounty = tonumber(info.Bounty) or 0
-                        }
-                    end
-                end
-            end
-            pending = pending - 1
-        end)
-    end
-    local deadline = tick() + (timeout or 20)
-    while pending > 0 and tick() < deadline do task.wait(0.1) end
-    return servers
-end
-
-local function GetServerList()
-    if Settings.MobileMode == true then return nil end
-    if ServerHopCache.List then return ServerHopCache.List end
-    if ServerHopCache.Fetching then
-        local deadline = tick() + 25
-        while ServerHopCache.Fetching and tick() < deadline do task.wait(0.1) end
-        return ServerHopCache.List
-    end
-    ServerHopCache.Fetching = true
-    local ok, servers = pcall(FetchServerList, 20)
-    ServerHopCache.Fetching = false
-    if ok and type(servers) == "table" and next(servers) then
-        ServerHopCache.List = servers
-    end
-    return ServerHopCache.List
-end
-
 local function MatchRegion(info)
     if not info then return false end
     local want = tostring(Settings.ServerRegion or "")
@@ -2415,33 +2352,6 @@ local function MatchServer(info)
     if count < HopMinPlayers or count > HopMaxPlayers then return false end
     local bounty = tonumber(info.Bounty) or 0
     return bounty >= HopMinBounty and bounty <= HopMaxBounty
-end
-
-local function MatchServerRelaxed(info)
-    return MatchRegion(info)
-end
-
-local function CollectMatches(servers, predicate)
-    local matches = {}
-    if type(servers) ~= "table" then return matches end
-    for job, info in pairs(servers) do
-        if job ~= game.JobId and predicate(info) then
-            table.insert(matches, { Job = job, Region = info.Region, Count = info.Count, Bounty = info.Bounty })
-        end
-    end
-    return matches
-end
-
-local function PickServer(servers)
-    local matches = CollectMatches(servers, MatchServer)
-    if #matches > 0 then
-        return matches[math.random(1, #matches)], false
-    end
-    local relaxed = CollectMatches(servers, MatchServerRelaxed)
-    if #relaxed > 0 then
-        return relaxed[math.random(1, #relaxed)], true
-    end
-    return nil, false
 end
 
 local HauntedEntrance = Vector3.new(923.2130126953125, 126.97599792480469, 32852.83203125)
@@ -2488,12 +2398,12 @@ end
 
 local HopInterruptedByDanger = false
 local HOP_LANDING_GRACE = 5
-local HOP_DELAY = 5
+local HOP_DELAY = 0.5
 local HopCooldownUntil = 0
 local HopWaitUntil = 0
 
--- Meyy-style mobile server hopping. Mobile mode uses ONLY this saved-server
--- queue + sequential page scanner; it never calls GetServerList/PickServer.
+-- Meyy Hub-style server hopping is the ONLY server-hop implementation.
+-- Mobile Mode enables background pre-scanning; otherwise scans on demand.
 local MeyySavedServers = {}
 local MeyyScanning = false
 local MeyyScanGeneration = 0
@@ -2534,7 +2444,7 @@ local function MeyyScanSequential(stopAfterFirst, backgroundScan)
     local firstTarget = nil
 
     for page = 1, 300 do
-        if not Settings.MobileMode or (backgroundScan and HopActive())
+        if (backgroundScan and not Settings.MobileMode) or (backgroundScan and HopActive())
             or (stopAfterFirst and not HopActive()) then break end
         local ok, result = pcall(function()
             return browser:InvokeServer(page)
@@ -2562,7 +2472,7 @@ task.spawn(function()
     while true do
         task.wait(2)
         if Settings.MobileMode and not HopActive() and not MeyyScanning
-            and not ServerHopCache.Fetching and #MeyySavedServers < 50 then
+            and #MeyySavedServers < 50 then
             MeyyScanSequential(false, true)
         end
     end
@@ -2600,20 +2510,9 @@ end
 local function BeginHopMatch()
     HopPhase = "matching"
     task.spawn(function()
-        local target
-        if Settings.MobileMode == true then
-            -- Mobile path is isolated: do not execute the legacy parallel fetch,
-            -- cache refresh, random picker, or relaxed fallback.
-            target = MeyyGetMobileTarget()
-        else
-            local servers = GetServerList()
-            target = PickServer(servers)
-            if not target then
-                ServerHopCache.List = nil
-                servers = GetServerList()
-                target = PickServer(servers)
-            end
-        end
+        -- Every hop uses Meyy's SavedServers queue and sequential scanner.
+        -- Mobile Mode only controls whether the queue is pre-filled in background.
+        local target = MeyyGetMobileTarget()
 
         if not HopActive() then return end
 
@@ -2659,7 +2558,7 @@ local function BeginHopMatch()
             ManualHopRequested = false
             DeathHopRequested = false
         end
-        task.wait(5)
+        task.wait(0.35)
         ManualHopRequested = false
         DeathHopRequested = false
         HopPhase = "idle"
@@ -3856,7 +3755,6 @@ LocalPlayer.CharacterAdded:Connect(function()
     end
     if HopActive() then
         HopPhase = "idle"
-        ServerHopCache.List = nil
         TargetLockStart = tick()
         HopCooldownUntil = tick() + HOP_LANDING_GRACE
     end
@@ -4592,7 +4490,6 @@ function MercifulBridge.Action(name)
         ResetTarget()
         HopPhase = "idle"
         HopPrepStartY = nil
-        ServerHopCache.List = nil
         SafeCall(DoServerHop)
     elseif name == "ResetAllServerTotals" then
         if HUD.ResetAllServerTotals then HUD.ResetAllServerTotals() end
@@ -4759,7 +4656,7 @@ pcall(function()
                 -- ApplyTeam / Stay.Performance:SetEnabled / RJR:ApplyWaterWalk where the old callbacks did
             end,
             Action = function(n)
-                if n == "ManualHop" then DeathHopRequested = true; HopPhase = "idle"; ServerHopCache.List = nil; SafeCall(DoServerHop)
+                if n == "ManualHop" then DeathHopRequested = true; HopPhase = "idle"; SafeCall(DoServerHop)
                 elseif n == "SaveConfig" then SaveConfig(false)
                 elseif n == "LoadConfig" then LoadConfig(false)
                 elseif n == "ExportConfig" then ConfigExport.CopyToClipboard(ConfigExport.Text(Settings))
@@ -5520,7 +5417,7 @@ local P3L, P3R = Column(pages[3], 0), Column(pages[3], 1)
 do
     local e = Card(P3L, "Server hop")
     e.Dropdown("ServerRegion", "Region", {"Random", "Oregon", "Florida", "Texas", "California", "Hong Kong", "Germany", "Brazil", "Singapore", "India"})
-    e.Toggle("MobileMode", "Mobile mode", "Uses only Meyy saved-server queue and sequential scanning while enabled")
+    e.Toggle("MobileMode", "Mobile mode", "Uses Meyy background saved-server scanning; all hops use Meyy method")
     e.Dropdown("HopPlayerRange", "Players", {"1-12", "3-12", "5-12", "7-12", "9-12"})
     e.Dropdown("HopBountyRange", "Min bounty", {"> 3M", "> 5M", "> 10M", "> 15M", "> 25M", "> 35M", "> 50M"})
     e.Slider("MaxStaySeconds", "Max stay (s)", 60, 1800, 30)
