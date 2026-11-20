@@ -527,11 +527,20 @@ local function T(text)
     return LangMap[text] or text
 end
 
-if getgenv and getgenv().AutoBountyMainLoaded and getgenv().AutoBountyMainReady then
-    return
+do
+    local guardEnv = getgenv and getgenv()
+    if guardEnv and guardEnv.AutoBountyMainLoaded then
+        -- Already running here (finished loading, or started in THIS server within the last 30s) -> don't start a second copy.
+        local startedHere = guardEnv.AutoBountyMainJob == game.JobId and (tick() - (tonumber(guardEnv.AutoBountyMainStart) or 0)) < 30
+        if guardEnv.AutoBountyMainReady or startedHere then
+            return
+        end
+    end
 end
 if getgenv then
     getgenv().AutoBountyMainLoaded = true
+    getgenv().AutoBountyMainJob = game.JobId
+    getgenv().AutoBountyMainStart = tick()
 end
 
 local LastCaughtError = nil
@@ -2290,7 +2299,7 @@ local function BuildReExecuteScript()
     GetEarnedBounty()
     local env = getgenv and getgenv()
     local lang = type(env) == "table" and (env.Language or env.language) or nil
-    local parts = { "getgenv().AutoBountyMainLoaded = nil" }
+    local parts = { "if getgenv().AutoBountyMainJob ~= game.JobId then getgenv().AutoBountyMainLoaded = nil end" }
     if type(lang) == "string" and lang ~= "" then
         parts[#parts + 1] = string.format("getgenv().Language = %q", lang)
     end
@@ -2306,19 +2315,24 @@ local function BuildReExecuteScript()
 
     local body = table.concat(parts, "\n") .. "\n"
     -- Auto Execute: after the hop, download and run the saved custom script link.
+    -- It waits for the new server to finish loading first (running a big script mid-teleport can crash mobile executors)
+    -- and does nothing if a copy of the script is already running in that server (e.g. from the executor's autoexec).
     local url = NormalizeScriptURL(Settings.AutoExecuteURL)
     if Settings.AutoExecute ~= false and url ~= "" then
         body = body
-            .. "repeat task.wait() until game:IsLoaded()\n"
-            .. "local __src\n"
-            .. "for __i = 1, 6 do\n"
-            .. string.format("    local __ok, __res = pcall(function() return game:HttpGet(%q) end)\n", url)
-            .. "    if __ok and type(__res) == \"string\" and #__res > 0 then __src = __res break end\n"
-            .. "    task.wait(2)\n"
-            .. "end\n"
-            .. "if __src then\n"
-            .. "    local __fn = loadstring(__src)\n"
-            .. "    if __fn then task.spawn(__fn) end\n"
+            .. "repeat task.wait() until game:IsLoaded() and game:GetService(\"Players\").LocalPlayer\n"
+            .. "task.wait(4)\n"
+            .. "if getgenv().AutoBountyMainJob ~= game.JobId then\n"
+            .. "    local __src\n"
+            .. "    for __i = 1, 6 do\n"
+            .. string.format("        local __ok, __res = pcall(function() return game:HttpGet(%q) end)\n", url)
+            .. "        if __ok and type(__res) == \"string\" and #__res > 0 then __src = __res break end\n"
+            .. "        task.wait(2)\n"
+            .. "    end\n"
+            .. "    if __src and getgenv().AutoBountyMainJob ~= game.JobId then\n"
+            .. "        local __fn = loadstring(__src)\n"
+            .. "        if __fn then task.spawn(__fn) end\n"
+            .. "    end\n"
             .. "end\n"
     end
     -- Guard so the same server never runs the queued script twice (it can be queued once per hop attempt).
@@ -2326,17 +2340,20 @@ local function BuildReExecuteScript()
 end
 
 local function QueueAutoReExecute()
+    local genvEnv = getgenv and getgenv()
+    -- Hop retries call this repeatedly; stacking several queued loaders is heavy and can crash mobile executors.
+    if type(genvEnv) == "table" and genvEnv.MercifulQueuedJob == game.JobId then return true end
     local source = BuildReExecuteScript()
+    local queued = false
     if type(queue_on_teleport) == "function" then
-        return select(1, pcall(queue_on_teleport, source))
+        queued = select(1, pcall(queue_on_teleport, source))
+    elseif type(queueonteleport) == "function" then
+        queued = select(1, pcall(queueonteleport, source))
+    elseif type(syn) == "table" and type(syn.queue_on_teleport) == "function" then
+        queued = select(1, pcall(syn.queue_on_teleport, source))
     end
-    if type(queueonteleport) == "function" then
-        return select(1, pcall(queueonteleport, source))
-    end
-    if type(syn) == "table" and type(syn.queue_on_teleport) == "function" then
-        return select(1, pcall(syn.queue_on_teleport, source))
-    end
-    return false
+    if queued and type(genvEnv) == "table" then genvEnv.MercifulQueuedJob = game.JobId end
+    return queued
 end
 
 task.spawn(function()
@@ -5168,6 +5185,70 @@ local function Elements(parent)
         return o
     end
 
+    function E.LinkInput(flag, title, placeholder)
+        local r = New("Frame", {Size = UDim2.new(1, 0, 0, 114), BorderSizePixel = 0, LayoutOrder = nextOrder(parent)}, parent)
+        R(r, "BackgroundColor3", "elem"); Corner(r, 9); Stroke(r, "stroke", 1, 0.3)
+        Text(r, title, 12, "text", Enum.Font.GothamBold, {Position = UDim2.fromOffset(12, 5), Size = UDim2.new(1, -24, 0, 16)})
+        local box = New("TextBox", {Text = tostring(Get(flag) or ""), PlaceholderText = placeholder or "", ClearTextOnFocus = false,
+            MultiLine = true, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, TextXAlignment = Enum.TextXAlignment.Left,
+            Font = Enum.Font.Gotham, TextSize = 11, Size = UDim2.new(1, -20, 0, 46), Position = UDim2.fromOffset(10, 26), BorderSizePixel = 0}, r)
+        R(box, "BackgroundColor3", "bg"); R(box, "TextColor3", "text"); Corner(box, 7); Stroke(box, "stroke", 1, 0.4)
+        box.PlaceholderColor3 = T.sub
+        local status = Text(r, "", 11, "sub", Enum.Font.GothamMedium, {Position = UDim2.fromOffset(12, 80), Size = UDim2.new(1, -112, 0, 26), TextWrapped = true})
+        local save = New("TextButton", {Text = "", AutoButtonColor = false, Size = UDim2.fromOffset(84, 28), AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.new(1, -10, 0, 79), BackgroundColor3 = WHITE, BorderSizePixel = 0}, r)
+        Corner(save, 8); Grad(save, 0)
+        New("TextLabel", {BackgroundTransparency = 1, Text = "Save", Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = WHITE, Size = UDim2.fromScale(1, 1)}, save)
+        C(save.MouseEnter, function() Tw(save, {BackgroundTransparency = 0.12}, 0.15) end)
+        C(save.MouseLeave, function() Tw(save, {BackgroundTransparency = 0}, 0.2) end)
+
+        local flashToken = 0
+        local function savedValue() return tostring(Get(flag) or "") end
+        local function typedValue() return (box.Text:gsub("%s+", "")) end
+        local function refreshStatus()
+            local cur, typed = savedValue(), typedValue()
+            if typed ~= cur then
+                status.Text = "Unsaved changes - press Save"
+                status.TextColor3 = T.A
+            elseif cur ~= "" then
+                status.Text = "Saved. Runs after every server hop"
+                status.TextColor3 = T.sub
+            else
+                status.Text = "No link set"
+                status.TextColor3 = T.sub
+            end
+        end
+        local function flash(text, bad)
+            flashToken = flashToken + 1
+            local my = flashToken
+            status.Text = text
+            status.TextColor3 = bad and Color3.fromRGB(244, 63, 94) or T.A
+            task.delay(2, function() if flashToken == my then refreshStatus() end end)
+        end
+        C(box:GetPropertyChangedSignal("Text"), refreshStatus)
+        C(save.MouseButton1Down, function() Tw(save, {Size = UDim2.fromOffset(78, 26)}, 0.08) end)
+        C(save.MouseButton1Click, function()
+            Tw(save, {Size = UDim2.fromOffset(84, 28)}, 0.3, BACK)
+            local raw = box.Text
+            Set(flag, raw)
+            local cur = savedValue()
+            if typedValue() == "" then
+                box.Text = ""
+                flash("Link cleared")
+            elseif cur ~= "" and raw:find(cur, 1, true) then
+                box.Text = cur
+                flash("Saved ✓")
+            else
+                flash("Invalid link - use a full http(s):// URL", true)
+            end
+        end)
+        local o = {}
+        function o.Set(v) box.Text = tostring(v or ""); refreshStatus() end
+        refreshStatus()
+        UI.Elements[flag] = o
+        return o
+    end
+
     function E.Dropdown(flag, title, values)
         local cur = Get(flag) or values[1]
         local ROW, ITEM = 38, 28
@@ -5483,7 +5564,7 @@ do
 
     local x = Card(P4R, "Auto Execute")
     x.Toggle("AutoExecute", "Run after server hop", "Re-runs your script link in the next server")
-    x.TextInput("AutoExecuteURL", "Script link (saved)", "https://raw.githubusercontent.com/you/script.lua")
+    x.LinkInput("AutoExecuteURL", "Script link", "https://raw.githubusercontent.com/you/script.lua")
 
     local _, preferencesCard = Card(P4R, "Preferences")
     Text(preferencesCard, "All settings are saved automatically.", 11, "sub", Enum.Font.Gotham,
