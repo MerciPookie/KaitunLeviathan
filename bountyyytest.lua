@@ -2341,62 +2341,21 @@ SetupHUD()
 local ServerHopCache = { List = nil, Fetching = false }
 
 local function FetchServerList(timeout)
+    -- Hard guard: the legacy parallel fetch is disabled whenever Mobile Mode is on.
+    if Settings.MobileMode == true then return nil end
     local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
     if not browser then return nil end
     local servers = {}
-
-    -- Mobile mode follows Meyy Hub's low-concurrency server-browser approach:
-    -- request one page at a time, with a small yield between requests. The old
-    -- desktop path intentionally keeps its parallel page fetch unchanged.
-    if Settings.MobileMode == true then
-        local maxPages = 300
-        for page = 1, maxPages do
-            if not HopActive() then break end
-            local ok, result = pcall(function()
-                return browser:InvokeServer(page)
-            end)
-            if not ok then
-                task.wait(0.35)
-                ok, result = pcall(function()
-                    return browser:InvokeServer(page)
-                end)
-            end
-
-            if ok and type(result) == "table" then
-                local foundStrictMatch = false
-                for job, info in pairs(result) do
-                    if type(info) == "table" then
-                        local normalized = {
-                            Region = tostring(info.Region or "Unknown"),
-                            Count = tonumber(info.Count) or 0,
-                            Bounty = tonumber(info.Bounty) or 0
-                        }
-                        servers[job] = normalized
-
-                        local wantedRegion = tostring(Settings.ServerRegion or "")
-                        local regionMatches = wantedRegion == "" or wantedRegion == "Random"
-                            or string.find(normalized.Region:lower(), wantedRegion:lower(), 1, true) ~= nil
-                        if job ~= game.JobId and regionMatches
-                            and normalized.Count >= HopMinPlayers and normalized.Count <= HopMaxPlayers
-                            and normalized.Bounty >= HopMinBounty and normalized.Bounty <= HopMaxBounty then
-                            foundStrictMatch = true
-                        end
-                    end
-                end
-                -- Like Meyy's browser scan, stop once a suitable page is found;
-                -- this avoids hundreds of unnecessary mobile network requests.
-                if foundStrictMatch then break end
-            end
-            task.wait(0.1)
-        end
-        return servers
-    end
 
     -- Desktop mode: retain the existing parallel fetch behavior.
     local pending = 0
     for page = 1, 100 do
         pending = pending + 1
         task.delay(page * 0.02, function()
+            if Settings.MobileMode == true then
+                pending = pending - 1
+                return
+            end
             local ok, result = pcall(function() return browser:InvokeServer(page) end)
             if not ok then
                 local tries = 0
@@ -2426,6 +2385,7 @@ local function FetchServerList(timeout)
 end
 
 local function GetServerList()
+    if Settings.MobileMode == true then return nil end
     if ServerHopCache.List then return ServerHopCache.List end
     if ServerHopCache.Fetching then
         local deadline = tick() + 25
@@ -2532,15 +2492,127 @@ local HOP_DELAY = 5
 local HopCooldownUntil = 0
 local HopWaitUntil = 0
 
+-- Meyy-style mobile server hopping. Mobile mode uses ONLY this saved-server
+-- queue + sequential page scanner; it never calls GetServerList/PickServer.
+local MeyySavedServers = {}
+local MeyyScanning = false
+local MeyyScanGeneration = 0
+
+local function MeyyServerMatches(job, info)
+    if job == game.JobId or type(info) ~= "table" then return false end
+    local normalized = {
+        Region = tostring(info.Region or "Unknown"),
+        Count = tonumber(info.Count) or 0,
+        Bounty = tonumber(info.Bounty) or 0
+    }
+    return MatchServer(normalized)
+end
+
+local function MeyyRememberServer(job)
+    if type(job) ~= "string" or job == "" or job == game.JobId then return end
+    if #MeyySavedServers >= 50 then return end
+    for _, savedJob in ipairs(MeyySavedServers) do
+        if savedJob == job then return end
+    end
+    table.insert(MeyySavedServers, job)
+end
+
+local function MeyyTakeSavedServer()
+    while #MeyySavedServers > 0 do
+        local job = table.remove(MeyySavedServers, 1)
+        if job ~= game.JobId then return {Job = job} end
+    end
+    return nil
+end
+
+local function MeyyScanSequential(stopAfterFirst, backgroundScan)
+    local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+    if not browser then return nil end
+    MeyyScanning = true
+    MeyyScanGeneration = MeyyScanGeneration + 1
+    local generation = MeyyScanGeneration
+    local firstTarget = nil
+
+    for page = 1, 300 do
+        if not Settings.MobileMode or (backgroundScan and HopActive())
+            or (stopAfterFirst and not HopActive()) then break end
+        local ok, result = pcall(function()
+            return browser:InvokeServer(page)
+        end)
+        if ok and type(result) == "table" then
+            for job, info in pairs(result) do
+                if MeyyServerMatches(job, info) then
+                    MeyyRememberServer(job)
+                    if not firstTarget then firstTarget = {Job = job} end
+                end
+            end
+        end
+        if stopAfterFirst and firstTarget then break end
+        if #MeyySavedServers >= 50 then break end
+        task.wait(backgroundScan and 0.2 or 0.1)
+    end
+
+    if MeyyScanGeneration == generation then MeyyScanning = false end
+    return firstTarget
+end
+
+-- Background pre-scan mirrors Meyy's SavedServers approach. It runs only
+-- while Mobile Mode is enabled and the hop state is idle, never beside a hop.
+task.spawn(function()
+    while true do
+        task.wait(2)
+        if Settings.MobileMode and not HopActive() and not MeyyScanning
+            and not ServerHopCache.Fetching and #MeyySavedServers < 50 then
+            MeyyScanSequential(false, true)
+        end
+    end
+end)
+
+local function MeyyGetMobileTarget()
+    -- If the background pre-scan is mid-request, let it stop cleanly before
+    -- starting the direct scan. This prevents overlapping browser InvokeServer calls.
+    local waitUntil = tick() + 20
+    while MeyyScanning and tick() < waitUntil do
+        task.wait(0.1)
+    end
+    -- Never overlap a background page request with a teleport or direct scan.
+    if MeyyScanning then return nil end
+    local queued = MeyyTakeSavedServer()
+    if queued then return queued end
+
+    -- No prefetched servers: use Meyy's direct, sequential page scan.
+    local directTarget = MeyyScanSequential(true)
+    if directTarget then
+        -- The scanner has already added it to the queue; remove that duplicate
+        -- from the queue because this target is being returned immediately.
+        for i = #MeyySavedServers, 1, -1 do
+            if MeyySavedServers[i] == directTarget.Job then
+                table.remove(MeyySavedServers, i)
+                break
+            end
+        end
+        return directTarget
+    end
+
+    return MeyyTakeSavedServer()
+end
+
 local function BeginHopMatch()
     HopPhase = "matching"
     task.spawn(function()
-        local servers = GetServerList()
-        local target = PickServer(servers)
-        if not target then
-            ServerHopCache.List = nil
-            servers = GetServerList()
+        local target
+        if Settings.MobileMode == true then
+            -- Mobile path is isolated: do not execute the legacy parallel fetch,
+            -- cache refresh, random picker, or relaxed fallback.
+            target = MeyyGetMobileTarget()
+        else
+            local servers = GetServerList()
             target = PickServer(servers)
+            if not target then
+                ServerHopCache.List = nil
+                servers = GetServerList()
+                target = PickServer(servers)
+            end
         end
 
         if not HopActive() then return end
@@ -5448,7 +5520,7 @@ local P3L, P3R = Column(pages[3], 0), Column(pages[3], 1)
 do
     local e = Card(P3L, "Server hop")
     e.Dropdown("ServerRegion", "Region", {"Random", "Oregon", "Florida", "Texas", "California", "Hong Kong", "Germany", "Brazil", "Singapore", "India"})
-    e.Toggle("MobileMode", "Mobile mode", "Uses Meyy-style sequential server scanning to reduce teleport/server-hop load")
+    e.Toggle("MobileMode", "Mobile mode", "Uses only Meyy saved-server queue and sequential scanning while enabled")
     e.Dropdown("HopPlayerRange", "Players", {"1-12", "3-12", "5-12", "7-12", "9-12"})
     e.Dropdown("HopBountyRange", "Min bounty", {"> 3M", "> 5M", "> 10M", "> 15M", "> 25M", "> 35M", "> 50M"})
     e.Slider("MaxStaySeconds", "Max stay (s)", 60, 1800, 30)
