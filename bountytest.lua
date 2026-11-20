@@ -527,20 +527,11 @@ local function T(text)
     return LangMap[text] or text
 end
 
-do
-    local guardEnv = getgenv and getgenv()
-    if guardEnv and guardEnv.AutoBountyMainLoaded then
-        -- Already running here (finished loading, or started in THIS server within the last 30s) -> don't start a second copy.
-        local startedHere = guardEnv.AutoBountyMainJob == game.JobId and (tick() - (tonumber(guardEnv.AutoBountyMainStart) or 0)) < 30
-        if guardEnv.AutoBountyMainReady or startedHere then
-            return
-        end
-    end
+if getgenv and getgenv().AutoBountyMainLoaded and getgenv().AutoBountyMainReady then
+    return
 end
 if getgenv then
     getgenv().AutoBountyMainLoaded = true
-    getgenv().AutoBountyMainJob = game.JobId
-    getgenv().AutoBountyMainStart = tick()
 end
 
 local LastCaughtError = nil
@@ -579,6 +570,7 @@ local Settings = {
     GunSkills = { "Z", "X" },
     V4Only = { Melee = false, Sword = false, ["Blox Fruit"] = false, Gun = false },
     FPSBoost = false,
+    MobileMode = false,
     WaterWalk = true,
     Hold = {
         Melee = { Z = 0.1, X = 0.1, C = 0.1, V = 0.1, F = 0.1 },
@@ -615,8 +607,6 @@ local Settings = {
     AutoSaveConfig = true,
     SelectTeam = "Pirates",
     MaxStaySeconds = 360,
-    AutoExecute = true,
-    AutoExecuteURL = "",
     ConfigVersion = 2
 }
 
@@ -2287,19 +2277,11 @@ pcall(function()
     if oldPanel then oldPanel:Destroy() end
 end)
 
--- Accepts a raw link OR a pasted loadstring(game:HttpGet("...")) line and returns just the http(s) URL ("" if none).
-local function NormalizeScriptURL(text)
-    if type(text) ~= "string" then return "" end
-    local url = text:match("https?://[^%s\"'%)%]]+")
-    if not url or #url > 2000 then return "" end
-    return url
-end
-
 local function BuildReExecuteScript()
     GetEarnedBounty()
     local env = getgenv and getgenv()
     local lang = type(env) == "table" and (env.Language or env.language) or nil
-    local parts = { "if getgenv().AutoBountyMainJob ~= game.JobId then getgenv().AutoBountyMainLoaded = nil end" }
+    local parts = { "getgenv().AutoBountyMainLoaded = nil" }
     if type(lang) == "string" and lang ~= "" then
         parts[#parts + 1] = string.format("getgenv().Language = %q", lang)
     end
@@ -2313,47 +2295,21 @@ local function BuildReExecuteScript()
         parts[#parts + 1] = "getgenv().AutoBountyMinimizeOnResume = true"
     end
 
-    local body = table.concat(parts, "\n") .. "\n"
-    -- Auto Execute: after the hop, download and run the saved custom script link.
-    -- It waits for the new server to finish loading first (running a big script mid-teleport can crash mobile executors)
-    -- and does nothing if a copy of the script is already running in that server (e.g. from the executor's autoexec).
-    local url = NormalizeScriptURL(Settings.AutoExecuteURL)
-    if Settings.AutoExecute ~= false and url ~= "" then
-        body = body
-            .. "repeat task.wait() until game:IsLoaded() and game:GetService(\"Players\").LocalPlayer\n"
-            .. "task.wait(4)\n"
-            .. "if getgenv().AutoBountyMainJob ~= game.JobId then\n"
-            .. "    local __src\n"
-            .. "    for __i = 1, 6 do\n"
-            .. string.format("        local __ok, __res = pcall(function() return game:HttpGet(%q) end)\n", url)
-            .. "        if __ok and type(__res) == \"string\" and #__res > 0 then __src = __res break end\n"
-            .. "        task.wait(2)\n"
-            .. "    end\n"
-            .. "    if __src and getgenv().AutoBountyMainJob ~= game.JobId then\n"
-            .. "        local __fn = loadstring(__src)\n"
-            .. "        if __fn then task.spawn(__fn) end\n"
-            .. "    end\n"
-            .. "end\n"
-    end
-    -- Guard so the same server never runs the queued script twice (it can be queued once per hop attempt).
-    return "local __g = getgenv()\nif __g.MercifulAEJob ~= game.JobId then\n__g.MercifulAEJob = game.JobId\n" .. body .. "end\n"
+    return table.concat(parts, "\n") .. "\n"
 end
 
 local function QueueAutoReExecute()
-    local genvEnv = getgenv and getgenv()
-    -- Hop retries call this repeatedly; stacking several queued loaders is heavy and can crash mobile executors.
-    if type(genvEnv) == "table" and genvEnv.MercifulQueuedJob == game.JobId then return true end
     local source = BuildReExecuteScript()
-    local queued = false
     if type(queue_on_teleport) == "function" then
-        queued = select(1, pcall(queue_on_teleport, source))
-    elseif type(queueonteleport) == "function" then
-        queued = select(1, pcall(queueonteleport, source))
-    elseif type(syn) == "table" and type(syn.queue_on_teleport) == "function" then
-        queued = select(1, pcall(syn.queue_on_teleport, source))
+        return select(1, pcall(queue_on_teleport, source))
     end
-    if queued and type(genvEnv) == "table" then genvEnv.MercifulQueuedJob = game.JobId end
-    return queued
+    if type(queueonteleport) == "function" then
+        return select(1, pcall(queueonteleport, source))
+    end
+    if type(syn) == "table" and type(syn.queue_on_teleport) == "function" then
+        return select(1, pcall(syn.queue_on_teleport, source))
+    end
+    return false
 end
 
 task.spawn(function()
@@ -2378,7 +2334,6 @@ HUD.GetStats = function()
 end
 HUD.ResetAllServerTotals = ResetAllServerTotals
 HUD.QueueAutoReExecute = QueueAutoReExecute
-HUD.NormalizeScriptURL = NormalizeScriptURL
 end
 
 SetupHUD()
@@ -2420,7 +2375,28 @@ local function FetchServerList(timeout)
     return servers
 end
 
+-- Mobile mode state (single table keeps the chunk under Luau's local-register limit).
+local MobileHop = { Saved = {}, Count = 0 }
+
 local function GetServerList()
+    -- Mobile mode: saved-list fast hop (pre-scanned servers), else a gentle sequential scan.
+    if Settings.MobileMode then
+        if ServerHopCache.Fetching then
+            local waitUntil = tick() + 30
+            while ServerHopCache.Fetching and tick() < waitUntil do task.wait(0.1) end
+        end
+        ServerHopCache.List = nil
+        if MobileHop.Count > 0 then
+            local snapshot = {}
+            for job, info in pairs(MobileHop.Saved) do snapshot[job] = info end
+            return snapshot
+        end
+        ServerHopCache.Fetching = true
+        local okM, foundM = pcall(MobileHop.Scan, 25, 5)
+        ServerHopCache.Fetching = false
+        if okM and type(foundM) == "table" and next(foundM) then return foundM end
+        return nil
+    end
     if ServerHopCache.List then return ServerHopCache.List end
     if ServerHopCache.Fetching then
         local deadline = tick() + 25
@@ -2466,6 +2442,65 @@ local function CollectMatches(servers, predicate)
     end
     return matches
 end
+
+function MobileHop.Remove(job)
+    if MobileHop.Saved[job] ~= nil then
+        MobileHop.Saved[job] = nil
+        MobileHop.Count = math.max(MobileHop.Count - 1, 0)
+    end
+end
+
+-- Sequential page scan (one request at a time). Strict matches are added to the saved list.
+function MobileHop.Scan(timeout, stopAfter)
+    local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+    if not browser then return nil end
+    local found, strictFound, failures = {}, 0, 0
+    local deadline = tick() + (timeout or 25)
+    for page = 1, 100 do
+        if tick() > deadline or strictFound >= (stopAfter or 5) then break end
+        local ok, result = pcall(function() return browser:InvokeServer(page) end)
+        if ok and type(result) == "table" then
+            failures = 0
+            for job, info in pairs(result) do
+                if type(info) == "table" and job ~= game.JobId then
+                    local entry = {
+                        Region = tostring(info.Region or "Unknown"),
+                        Count = tonumber(info.Count) or 0,
+                        Bounty = tonumber(info.Bounty) or 0
+                    }
+                    if MatchRegion(entry) then
+                        found[job] = entry
+                        if MatchServer(entry) then
+                            strictFound += 1
+                            if MobileHop.Saved[job] == nil and MobileHop.Count < 50 then
+                                MobileHop.Saved[job] = entry
+                                MobileHop.Count += 1
+                            end
+                        end
+                    end
+                end
+            end
+        else
+            failures += 1
+            if failures >= 3 then break end
+        end
+        task.wait(0.2)
+    end
+    return found
+end
+
+-- Background scanner: keeps a small list of good servers ready so hopping is instant.
+task.spawn(function()
+    while true do
+        task.wait(3)
+        if Settings.MobileMode and AutoBountyArmed and MobileHop.Count < 10 and not ServerHopCache.Fetching then
+            ServerHopCache.Fetching = true
+            pcall(MobileHop.Scan, 25, 25)
+            ServerHopCache.Fetching = false
+            task.wait(5)
+        end
+    end
+end)
 
 local function PickServer(servers)
     local matches = CollectMatches(servers, MatchServer)
@@ -2527,6 +2562,15 @@ local HOP_DELAY = 5
 local HopCooldownUntil = 0
 local HopWaitUntil = 0
 
+-- Mobile mode: if a teleport fails (full server etc.), retry quickly with the next saved server.
+pcall(function()
+    game:GetService("TeleportService").TeleportInitFailed:Connect(function()
+        if not Settings.MobileMode then return end
+        HopPhase = "idle"
+        HopCooldownUntil = tick() + 1
+    end)
+end)
+
 local function BeginHopMatch()
     HopPhase = "matching"
     task.spawn(function()
@@ -2568,6 +2612,7 @@ local function BeginHopMatch()
                 return
             end
             HUD.QueueAutoReExecute()
+            if Settings.MobileMode then MobileHop.Remove(target.Job) end
             local teleportOk = pcall(function() browser:InvokeServer("teleport", target.Job) end)
             if not teleportOk then
                 HopPhase = "idle"
@@ -4167,7 +4212,6 @@ local function LoadConfig(silent)
     end
 
     ApplyConfigTable(data)
-    if type(Settings.AutoExecuteURL) ~= "string" then Settings.AutoExecuteURL = "" end
 
     ApplyPlayerRange(Settings.HopPlayerRange)
     ApplyBountyRange(Settings.HopBountyRange)
@@ -4451,21 +4495,6 @@ function MercifulBridge.Set(flag, value)
         else
             Settings.HoldWeapon = value
         end
-    elseif flag == "AutoExecuteURL" then
-        local raw = tostring(value or "")
-        local env = getgenv and getgenv()
-        local ui = type(env) == "table" and env.MercifulUI or nil
-        if raw:match("^%s*$") then
-            Settings.AutoExecuteURL = ""
-        else
-            local url = HUD.NormalizeScriptURL and HUD.NormalizeScriptURL(raw) or ""
-            if url ~= "" then
-                Settings.AutoExecuteURL = url
-                if ui and not ConfigLoading then ui.Notify("Auto Execute link saved", 2.5) end
-            elseif ui then
-                ui.Notify("Enter a valid http(s) script link", 3)
-            end
-        end
     elseif flag == "SkillOrder" then
         Settings.SkillOrder = MercifulBridge.ParseSkillOrder(value)
         if #Settings.SkillOrder == 0 then
@@ -4711,7 +4740,7 @@ pcall(function()
            MeleeSkills SwordSkills FruitSkills GunSkills (arrays of "Z".."F"), <Melee|Sword|Fruit|Gun>V4Only, <Prefix>Hold<Key>
            ServerRegion HopPlayerRange HopBountyRange ("> 3M" ...) MaxStaySeconds
            ESP ESP_ShowName ESP_ShowLevel ESP_ShowHealth ESP_ShowDistance ESP_ShowPVP ESP_FontSize WaterWalk FPSBoost
-           AutoSaveConfig AutoLoadConfig AutoExecute AutoExecuteURL Theme UI_Island UI_IslandAuto UI_Anim UI_Orb
+           AutoSaveConfig AutoLoadConfig Theme UI_Island UI_IslandAuto UI_Anim UI_Orb
 ]==]
 
 local TweenService     = game:GetService("TweenService")
@@ -5185,70 +5214,6 @@ local function Elements(parent)
         return o
     end
 
-    function E.LinkInput(flag, title, placeholder)
-        local r = New("Frame", {Size = UDim2.new(1, 0, 0, 114), BorderSizePixel = 0, LayoutOrder = nextOrder(parent)}, parent)
-        R(r, "BackgroundColor3", "elem"); Corner(r, 9); Stroke(r, "stroke", 1, 0.3)
-        Text(r, title, 12, "text", Enum.Font.GothamBold, {Position = UDim2.fromOffset(12, 5), Size = UDim2.new(1, -24, 0, 16)})
-        local box = New("TextBox", {Text = tostring(Get(flag) or ""), PlaceholderText = placeholder or "", ClearTextOnFocus = false,
-            MultiLine = true, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, TextXAlignment = Enum.TextXAlignment.Left,
-            Font = Enum.Font.Gotham, TextSize = 11, Size = UDim2.new(1, -20, 0, 46), Position = UDim2.fromOffset(10, 26), BorderSizePixel = 0}, r)
-        R(box, "BackgroundColor3", "bg"); R(box, "TextColor3", "text"); Corner(box, 7); Stroke(box, "stroke", 1, 0.4)
-        box.PlaceholderColor3 = T.sub
-        local status = Text(r, "", 11, "sub", Enum.Font.GothamMedium, {Position = UDim2.fromOffset(12, 80), Size = UDim2.new(1, -112, 0, 26), TextWrapped = true})
-        local save = New("TextButton", {Text = "", AutoButtonColor = false, Size = UDim2.fromOffset(84, 28), AnchorPoint = Vector2.new(1, 0),
-            Position = UDim2.new(1, -10, 0, 79), BackgroundColor3 = WHITE, BorderSizePixel = 0}, r)
-        Corner(save, 8); Grad(save, 0)
-        New("TextLabel", {BackgroundTransparency = 1, Text = "Save", Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = WHITE, Size = UDim2.fromScale(1, 1)}, save)
-        C(save.MouseEnter, function() Tw(save, {BackgroundTransparency = 0.12}, 0.15) end)
-        C(save.MouseLeave, function() Tw(save, {BackgroundTransparency = 0}, 0.2) end)
-
-        local flashToken = 0
-        local function savedValue() return tostring(Get(flag) or "") end
-        local function typedValue() return (box.Text:gsub("%s+", "")) end
-        local function refreshStatus()
-            local cur, typed = savedValue(), typedValue()
-            if typed ~= cur then
-                status.Text = "Unsaved changes - press Save"
-                status.TextColor3 = T.A
-            elseif cur ~= "" then
-                status.Text = "Saved. Runs after every server hop"
-                status.TextColor3 = T.sub
-            else
-                status.Text = "No link set"
-                status.TextColor3 = T.sub
-            end
-        end
-        local function flash(text, bad)
-            flashToken = flashToken + 1
-            local my = flashToken
-            status.Text = text
-            status.TextColor3 = bad and Color3.fromRGB(244, 63, 94) or T.A
-            task.delay(2, function() if flashToken == my then refreshStatus() end end)
-        end
-        C(box:GetPropertyChangedSignal("Text"), refreshStatus)
-        C(save.MouseButton1Down, function() Tw(save, {Size = UDim2.fromOffset(78, 26)}, 0.08) end)
-        C(save.MouseButton1Click, function()
-            Tw(save, {Size = UDim2.fromOffset(84, 28)}, 0.3, BACK)
-            local raw = box.Text
-            Set(flag, raw)
-            local cur = savedValue()
-            if typedValue() == "" then
-                box.Text = ""
-                flash("Link cleared")
-            elseif cur ~= "" and raw:find(cur, 1, true) then
-                box.Text = cur
-                flash("Saved ✓")
-            else
-                flash("Invalid link - use a full http(s):// URL", true)
-            end
-        end)
-        local o = {}
-        function o.Set(v) box.Text = tostring(v or ""); refreshStatus() end
-        refreshStatus()
-        UI.Elements[flag] = o
-        return o
-    end
-
     function E.Dropdown(flag, title, values)
         local cur = Get(flag) or values[1]
         local ROW, ITEM = 38, 28
@@ -5525,6 +5490,7 @@ do
     e.Dropdown("ServerRegion", "Region", {"Random", "Oregon", "Florida", "Texas", "California", "Hong Kong", "Germany", "Brazil", "Singapore", "India"})
     e.Dropdown("HopPlayerRange", "Players", {"1-12", "3-12", "5-12", "7-12", "9-12"})
     e.Dropdown("HopBountyRange", "Min bounty", {"> 3M", "> 5M", "> 10M", "> 15M", "> 25M", "> 35M", "> 50M"})
+    e.Toggle("MobileMode", "Mobile mode", "Meyy-style saved-list hop, lighter on phones")
     e.Slider("MaxStaySeconds", "Max stay (s)", 60, 1800, 30)
     e.Copy("Server ID", game.JobId ~= "" and game.JobId or "Studio")
     e.Button("ManualHop", "Hop now", true)
@@ -5561,10 +5527,6 @@ do
     e.Toggle("UI_IslandAuto", "Island toasts", "Pop status changes on the island")
     e.Toggle("UI_Anim", "Animations", "Off = instant, max fps")
     e.Toggle("UI_Orb", "Floating button")
-
-    local x = Card(P4R, "Auto Execute")
-    x.Toggle("AutoExecute", "Run after server hop", "Re-runs your script link in the next server")
-    x.LinkInput("AutoExecuteURL", "Script link", "https://raw.githubusercontent.com/you/script.lua")
 
     local _, preferencesCard = Card(P4R, "Preferences")
     Text(preferencesCard, "All settings are saved automatically.", 11, "sub", Enum.Font.Gotham,
