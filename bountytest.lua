@@ -570,7 +570,6 @@ local Settings = {
     GunSkills = { "Z", "X" },
     V4Only = { Melee = false, Sword = false, ["Blox Fruit"] = false, Gun = false },
     FPSBoost = false,
-    MobileMode = false,
     WaterWalk = true,
     Hold = {
         Melee = { Z = 0.1, X = 0.1, C = 0.1, V = 0.1, F = 0.1 },
@@ -601,6 +600,7 @@ local Settings = {
     LockTime = 90,
     HoldWeapon = "Melee",
     ServerRegion = "Singapore",
+    MobileMode = false,
     HopPlayerRange = "1-12",
     HopBountyRange = T("> 3M"),
     AutoLoadConfig = true,
@@ -2343,7 +2343,57 @@ local ServerHopCache = { List = nil, Fetching = false }
 local function FetchServerList(timeout)
     local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
     if not browser then return nil end
-    local servers, pending = {}, 0
+    local servers = {}
+
+    -- Mobile mode follows Meyy Hub's low-concurrency server-browser approach:
+    -- request one page at a time, with a small yield between requests. The old
+    -- desktop path intentionally keeps its parallel page fetch unchanged.
+    if Settings.MobileMode == true then
+        local maxPages = 300
+        for page = 1, maxPages do
+            if not HopActive() then break end
+            local ok, result = pcall(function()
+                return browser:InvokeServer(page)
+            end)
+            if not ok then
+                task.wait(0.35)
+                ok, result = pcall(function()
+                    return browser:InvokeServer(page)
+                end)
+            end
+
+            if ok and type(result) == "table" then
+                local foundStrictMatch = false
+                for job, info in pairs(result) do
+                    if type(info) == "table" then
+                        local normalized = {
+                            Region = tostring(info.Region or "Unknown"),
+                            Count = tonumber(info.Count) or 0,
+                            Bounty = tonumber(info.Bounty) or 0
+                        }
+                        servers[job] = normalized
+
+                        local wantedRegion = tostring(Settings.ServerRegion or "")
+                        local regionMatches = wantedRegion == "" or wantedRegion == "Random"
+                            or string.find(normalized.Region:lower(), wantedRegion:lower(), 1, true) ~= nil
+                        if job ~= game.JobId and regionMatches
+                            and normalized.Count >= HopMinPlayers and normalized.Count <= HopMaxPlayers
+                            and normalized.Bounty >= HopMinBounty and normalized.Bounty <= HopMaxBounty then
+                            foundStrictMatch = true
+                        end
+                    end
+                end
+                -- Like Meyy's browser scan, stop once a suitable page is found;
+                -- this avoids hundreds of unnecessary mobile network requests.
+                if foundStrictMatch then break end
+            end
+            task.wait(0.1)
+        end
+        return servers
+    end
+
+    -- Desktop mode: retain the existing parallel fetch behavior.
+    local pending = 0
     for page = 1, 100 do
         pending = pending + 1
         task.delay(page * 0.02, function()
@@ -2375,28 +2425,7 @@ local function FetchServerList(timeout)
     return servers
 end
 
--- Mobile mode state (single table keeps the chunk under Luau's local-register limit).
-local MobileHop = { Saved = {}, Count = 0 }
-
 local function GetServerList()
-    -- Mobile mode: saved-list fast hop (pre-scanned servers), else a gentle sequential scan.
-    if Settings.MobileMode then
-        if ServerHopCache.Fetching then
-            local waitUntil = tick() + 30
-            while ServerHopCache.Fetching and tick() < waitUntil do task.wait(0.1) end
-        end
-        ServerHopCache.List = nil
-        if MobileHop.Count > 0 then
-            local snapshot = {}
-            for job, info in pairs(MobileHop.Saved) do snapshot[job] = info end
-            return snapshot
-        end
-        ServerHopCache.Fetching = true
-        local okM, foundM = pcall(MobileHop.Scan, 25, 5)
-        ServerHopCache.Fetching = false
-        if okM and type(foundM) == "table" and next(foundM) then return foundM end
-        return nil
-    end
     if ServerHopCache.List then return ServerHopCache.List end
     if ServerHopCache.Fetching then
         local deadline = tick() + 25
@@ -2442,65 +2471,6 @@ local function CollectMatches(servers, predicate)
     end
     return matches
 end
-
-function MobileHop.Remove(job)
-    if MobileHop.Saved[job] ~= nil then
-        MobileHop.Saved[job] = nil
-        MobileHop.Count = math.max(MobileHop.Count - 1, 0)
-    end
-end
-
--- Sequential page scan (one request at a time). Strict matches are added to the saved list.
-function MobileHop.Scan(timeout, stopAfter)
-    local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
-    if not browser then return nil end
-    local found, strictFound, failures = {}, 0, 0
-    local deadline = tick() + (timeout or 25)
-    for page = 1, 100 do
-        if tick() > deadline or strictFound >= (stopAfter or 5) then break end
-        local ok, result = pcall(function() return browser:InvokeServer(page) end)
-        if ok and type(result) == "table" then
-            failures = 0
-            for job, info in pairs(result) do
-                if type(info) == "table" and job ~= game.JobId then
-                    local entry = {
-                        Region = tostring(info.Region or "Unknown"),
-                        Count = tonumber(info.Count) or 0,
-                        Bounty = tonumber(info.Bounty) or 0
-                    }
-                    if MatchRegion(entry) then
-                        found[job] = entry
-                        if MatchServer(entry) then
-                            strictFound += 1
-                            if MobileHop.Saved[job] == nil and MobileHop.Count < 50 then
-                                MobileHop.Saved[job] = entry
-                                MobileHop.Count += 1
-                            end
-                        end
-                    end
-                end
-            end
-        else
-            failures += 1
-            if failures >= 3 then break end
-        end
-        task.wait(0.2)
-    end
-    return found
-end
-
--- Background scanner: keeps a small list of good servers ready so hopping is instant.
-task.spawn(function()
-    while true do
-        task.wait(3)
-        if Settings.MobileMode and AutoBountyArmed and MobileHop.Count < 10 and not ServerHopCache.Fetching then
-            ServerHopCache.Fetching = true
-            pcall(MobileHop.Scan, 25, 25)
-            ServerHopCache.Fetching = false
-            task.wait(5)
-        end
-    end
-end)
 
 local function PickServer(servers)
     local matches = CollectMatches(servers, MatchServer)
@@ -2562,15 +2532,6 @@ local HOP_DELAY = 5
 local HopCooldownUntil = 0
 local HopWaitUntil = 0
 
--- Mobile mode: if a teleport fails (full server etc.), retry quickly with the next saved server.
-pcall(function()
-    game:GetService("TeleportService").TeleportInitFailed:Connect(function()
-        if not Settings.MobileMode then return end
-        HopPhase = "idle"
-        HopCooldownUntil = tick() + 1
-    end)
-end)
-
 local function BeginHopMatch()
     HopPhase = "matching"
     task.spawn(function()
@@ -2612,7 +2573,6 @@ local function BeginHopMatch()
                 return
             end
             HUD.QueueAutoReExecute()
-            if Settings.MobileMode then MobileHop.Remove(target.Job) end
             local teleportOk = pcall(function() browser:InvokeServer("teleport", target.Job) end)
             if not teleportOk then
                 HopPhase = "idle"
@@ -5488,9 +5448,9 @@ local P3L, P3R = Column(pages[3], 0), Column(pages[3], 1)
 do
     local e = Card(P3L, "Server hop")
     e.Dropdown("ServerRegion", "Region", {"Random", "Oregon", "Florida", "Texas", "California", "Hong Kong", "Germany", "Brazil", "Singapore", "India"})
+    e.Toggle("MobileMode", "Mobile mode", "Uses Meyy-style sequential server scanning to reduce teleport/server-hop load")
     e.Dropdown("HopPlayerRange", "Players", {"1-12", "3-12", "5-12", "7-12", "9-12"})
     e.Dropdown("HopBountyRange", "Min bounty", {"> 3M", "> 5M", "> 10M", "> 15M", "> 25M", "> 35M", "> 50M"})
-    e.Toggle("MobileMode", "Mobile mode", "Meyy-style saved-list hop, lighter on phones")
     e.Slider("MaxStaySeconds", "Max stay (s)", 60, 1800, 30)
     e.Copy("Server ID", game.JobId ~= "" and game.JobId or "Studio")
     e.Button("ManualHop", "Hop now", true)
